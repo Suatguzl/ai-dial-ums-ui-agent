@@ -16,6 +16,9 @@ from agent.clients.stdio_mcp_client import StdioMCPClient
 from agent.conversation_manager import ConversationManager
 from agent.models.message import Message
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -37,42 +40,92 @@ async def lifespan(app: FastAPI):
 
     logger.info("Application startup initiated")
 
-    #TODO:
-    # 1. Create empty list with dicts with name `tools`
-    # 2. Create empty dict with name `tool_name_client_map` that applies as key `str` and sa value `HttpMCPClient | StdioMCPClient`
-    # 3. Create HttpMCPClient for UMS MCP, url is "http://localhost:8005/mcp" (HttpMCPClient has static method create,
-    #    don't forget that it is async and you need to await)
-    # 4. Get tools for UMS MCP, iterate through them and add it to `tools` and and to the `tool_name_client_map`, key
-    #    is tool name, value the UMS MCP Client
-    # 5. Do the same as in 3 and 4 steps for Fetch MCP, url is "https://remote.mcpservers.org/fetch/mcp"
-    # 6. Create StdioMCPClient for DuckDuckGo, docker image name is "mcp/duckduckgo:latest", and do the same as in 4th step
-    # 7. Initialize DialClient with:
-    #       - api_key=os.getenv("DIAL_API_KEY")
-    #       - endpoint="https://ai-proxy.lab.epam.com"
-    #       - model, here choose gpt-4o or claude-3-7-sonnet@20250219, would be perfect if you test it with both of them later
-    #       - tools=tools
-    #       - tool_name_client_map=tool_name_client_map
-    # 8. Create Redis client (redis.Redis) with:
-    #       - host=os.getenv("REDIS_HOST", "localhost")
-    #       - port=int(os.getenv("REDIS_PORT", 6379))
-    #       - decode_responses=True
-    # 9. ping to redis to check if its alive (ping method in redis client)
-    # 10. Create ConversationManager with DIAL clien and Redis client and assign to `conversation_manager` (global variable)
+    tools: list[dict] = []
+    tool_name_client_map: dict[str, HttpMCPClient | StdioMCPClient] = {}
+
+    ## Initialize Fetch MCP client
+    #logger.info("Initializing Fetch MCP client")
+    #
+    #fetch_mcp_url = "https://remote.mcpservers.org/fetch/mcp"
+    #logger.info("Fetch MCP URL: %s", fetch_mcp_url)
+    #fetch_mcp_client: HttpMCPClient = await HttpMCPClient.create(fetch_mcp_url)
+    #
+    #for tool in await fetch_mcp_client.get_tools():
+    #    tool_name = tool.get('function', {}).get('name')
+    #    tools.append(tool)
+    #    tool_name_client_map[tool_name] = fetch_mcp_client
+    #    logger.info(f"Registered UMS tool", extra={"tool_name": tool_name})
+
+    # Initialize UMS MCP client
+    logger.info("Initializing UMS MCP client")
+
+    ums_mcp_url = os.getenv("UMS_MCP_URL", "http://localhost:8005/mcp")
+    logger.info("UMS MCP URL: %s", ums_mcp_url)
+    ums_mcp_client: HttpMCPClient = await HttpMCPClient.create(ums_mcp_url)
+
+    for tool in await ums_mcp_client.get_tools():
+        tool_name = tool.get('function', {}).get('name')
+        tools.append(tool)
+        tool_name_client_map[tool_name] = ums_mcp_client
+        logger.info(f"Registered UMS tool", extra={"tool_name": tool_name})
+
+    # Initialize DuckDuckGo MCP client
+    logger.info("Initializing DuckDuckGo MCP client")
+    duckduckgo_mcp_client = await StdioMCPClient.create(docker_image="khshanovskyi/ddg-mcp-server:latest")
+    for tool in await duckduckgo_mcp_client.get_tools():
+        tool_name = tool.get('function', {}).get('name')
+        tools.append(tool)
+        tool_name_client_map[tool_name] = duckduckgo_mcp_client
+        logger.info("Registered DuckDuckGo tool", extra={"tool_name": tool_name})
+
+    # Initialize DialClient
+    logger.info("Initializing DialClient")
+    dial_client = DialClient(
+        api_key = os.getenv("DIAL_API_KEY"),
+        endpoint="https://ai-proxy.lab.epam.com",
+        model="gpt-4o",
+        tools=tools,
+        tool_name_client_map=tool_name_client_map
+    )
+
+    # Initialize RedisClient
+    logger.info("Initializing RedisClient")
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", 6379))
+
+    redis_client = redis.Redis(
+        host = redis_host,
+        port=redis_port,
+        decode_responses=True
+    )
+
+    logger.info(
+        "Connecting to Redis",
+        extra={"host": redis_host, "port": redis_port}
+    )
+
+    await redis_client.ping()
+    logger.info("Redis connection established successfully")
+
+    # Initialize ConversationManager with both dependencies
+    conversation_manager = ConversationManager(dial_client, redis_client)
+    logger.info("ConversationManager initialized successfully")
+    logger.info("Application startup completed")
     yield
+    logger.info("Application shutdown initiated")
+    await redis_client.close()
+    logger.info("Application shutdown completed")
 
 
 app = FastAPI(
-    #TODO: add `lifespan` param from above, like:
-    # - lifespan=lifespan
+    lifespan=lifespan
 )
 app.add_middleware(
-    #TODO:
-    # Since we will run it locally there will be some issues from FrontEnd side with CORS, and its okay for local setup to disable them:
-    #   - CORSMiddleware,
-    #   - allow_origins=["*"]
-    #   - allow_credentials=True
-    #   - allow_methods=["*"]
-    #   - allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 
@@ -112,10 +165,12 @@ async def health():
 @app.post("/conversations")
 async def create_conversation(request: CreateConversationRequest):
     """Create a new conversation"""
-    #TODO:
-    # 1. Check if `conversation_manager` is present, if not then raise HTTPException(status_code=503, detail="Service not initialized")
-    # 2. return result of `conversation_manager` create conversation with request title (it is async, don't forget about await)
-    raise NotImplementedError()
+    if not conversation_manager:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info("Creating new conversation", extra={"title": request.title})
+    return await conversation_manager.create_conversation(request.title)
+
 
 
 @app.get("/conversations")
@@ -125,7 +180,14 @@ async def list_conversations():
     # 1. Check if `conversation_manager` is present, if not then raise HTTPException(status_code=503, detail="Service not initialized")
     # 2. Get conversations list with `conversation_manager` (it is async, don't forget about await)
     # 3. Converts dicts to `ConversationSummary` (iterate through it and create `ConversationSummary(**conv_dict)`) and return the result
-    raise NotImplementedError()
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.debug("Listing conversations")
+    conversations = await conversation_manager.list_conversations()
+    return [ConversationSummary(**conv_dict) for conv_dict in conversations]
+
 
 
 @app.get("/conversations/{conversation_id}")
@@ -136,7 +198,17 @@ async def get_conversation(conversation_id: str):
     # 2. Get conversation by id with `conversation_manager` (it is async, don't forget about await)
     # 3. If no conversation was found then raise `HTTPException(status_code=404, detail="Conversation not found")`
     # 4. return retrieved conversation
-    raise NotImplementedError()
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info("Fetching conversation", extra={"conversation_id": conversation_id})
+    conversation = await conversation_manager.get_conversation(conversation_id)
+
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return conversation
 
 
 @app.delete("/conversations/{conversation_id}")
@@ -147,7 +219,17 @@ async def delete_conversation(conversation_id: str):
     # 2. Delete conversation by id with `conversation_manager` (it is async, don't forget about await)
     # 3. If no conversation was returned then raise `HTTPException(status_code=404, detail="Conversation not found")`
     # 4. return `{"message": "Conversation deleted successfully"}`
-    raise NotImplementedError()
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info("Deleting conversation", extra={"conversation_id": conversation_id})
+    deleted = await conversation_manager.delete_conversation(conversation_id)
+    if not deleted:
+        logger.warning("Conversation not found for deletion", extra={"conversation_id": conversation_id})
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return {"message": "Conversation deleted successfully"}
 
 
 @app.post("/conversations/{conversation_id}/chat")
@@ -164,16 +246,55 @@ async def chat(conversation_id: str, request: ChatRequest):
     #   - conversation_id=conversation_id
     #   - stream=request.stream
     # 3. If `request.stream` then return `StreamingResponse(result, media_type="text/event-stream")`, otherwise return `ChatResponse(**result)`
-    raise NotImplementedError()
+
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info(
+        "Chat request received",
+        extra={
+            "conversation_id": conversation_id,
+            "stream": request.stream,
+            "message_role": request.message.role
+        }
+    )
+
+    result = await conversation_manager.chat(
+        conversation_id=conversation_id,
+        user_message=request.message,
+        stream=request.stream,
+    )
+
+    if request.stream:
+        logger.debug("Returning streaming response...")
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream"
+        )
+    else:
+        logger.debug("Returning non-streaming response...")
+        return ChatResponse(**result)
+
+from fastapi.responses import FileResponse
+from pathlib import Path
+
+# Add this route to serve the UI
+@app.get("/", response_class=FileResponse)
+async def serve_ui():
+    """Serve the main UI page"""
+    html_path = Path(__file__).parent.parent / "index.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="UI file not found")
+    return FileResponse(html_path)
 
 
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting UMS Agent server")
     uvicorn.run(
-        #TODO:
-        #  - app
-        #  - host="0.0.0.0"
-        #  - port=8011
-        #  - log_level="debug"
+        app,
+        host="0.0.0.0",
+        port=8011,
+        log_level="debug"
     )
